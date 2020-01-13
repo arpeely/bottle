@@ -75,7 +75,7 @@ if py3k:
     from urllib.parse import urljoin, SplitResult as UrlSplitResult
     from urllib.parse import urlencode, quote as urlquote, unquote as urlunquote
     urlunquote = functools.partial(urlunquote, encoding='latin1')
-    from http.cookies import SimpleCookie
+    from http.cookies import SimpleCookie, Morsel, CookieError
     if py >= (3, 3, 0):
         from collections.abc import MutableMapping as DictMixin
         from types import ModuleType as new_module
@@ -1049,15 +1049,22 @@ class BaseRequest(object):
         cookies = SimpleCookie(self.environ.get('HTTP_COOKIE','')).values()
         return FormsDict((c.key, c.value) for c in cookies)
 
-    def get_cookie(self, key, default=None, secret=None):
+    def get_cookie(self, key, default=None, secret=None, digestmod=hashlib.sha256):
         """ Return the content of a cookie. To read a `Signed Cookie`, the
             `secret` must match the one used to create the cookie (see
             :meth:`BaseResponse.set_cookie`). If anything goes wrong (missing
             cookie or wrong signature), return a default value. """
         value = self.cookies.get(key)
-        if secret and value:
-            dec = cookie_decode(value, secret) # (key, value) tuple or None
-            return dec[1] if dec and dec[0] == key else default
+        if secret:
+            # See BaseResponse.set_cookie for details on signed cookies.
+            if value and value.startswith('!') and '?' in value:
+                sig, msg = map(tob, value[1:].split('?', 1))
+                hash = hmac.new(tob(secret), msg, digestmod=digestmod).digest()
+                if _lscmp(sig, base64.b64encode(hash)):
+                    dst = pickle.loads(base64.b64decode(msg))
+                    if dst and dst[0] == key:
+                        return dst[1]
+            return default
         return value or default
 
     @DictProperty('environ', 'bottle.request.query', read_only=True)
@@ -1585,18 +1592,15 @@ class BaseResponse(object):
             return self.content_type.split('charset=')[-1].split(';')[0].strip()
         return default
 
-    def set_cookie(self, name, value, secret=None, **options):
-        ''' Create a new cookie or replace an old one. If the `secret` parameter is
+    def set_cookie(self, name, value, secret=None, digestmod=hashlib.sha256, **options):
+        """ Create a new cookie or replace an old one. If the `secret` parameter is
             set, create a `Signed Cookie` (described below).
-
             :param name: the name of the cookie.
             :param value: the value of the cookie.
             :param secret: a signature key required for signed cookies.
-
             Additionally, this method accepts all RFC 2109 attributes that are
             supported by :class:`cookie.Morsel`, including:
-
-            :param max_age: maximum age in seconds. (default: None)
+            :param maxage: maximum age in seconds. (default: None)
             :param expires: a datetime object or UNIX timestamp. (default: None)
             :param domain: the domain that is allowed to read the cookie.
               (default: current domain)
@@ -1604,42 +1608,63 @@ class BaseResponse(object):
             :param secure: limit the cookie to HTTPS connections (default: off).
             :param httponly: prevents client-side javascript to read this cookie
               (default: off, requires Python 2.6 or newer).
-
-            If neither `expires` nor `max_age` is set (default), the cookie will
+            :param samesite: Control or disable third-party use for this cookie.
+              Possible values: `lax`, `strict` or `none` (default).
+            If neither `expires` nor `maxage` is set (default), the cookie will
             expire at the end of the browser session (as soon as the browser
             window is closed).
-
             Signed cookies may store any pickle-able object and are
             cryptographically signed to prevent manipulation. Keep in mind that
             cookies are limited to 4kb in most browsers.
-
+            Warning: Pickle is a potentially dangerous format. If an attacker
+            gains access to the secret key, he could forge cookies that execute
+            code on server side if unpickled. Using pickle is discouraged and
+            support for it will be removed in later versions of bottle.
             Warning: Signed cookies are not encrypted (the client can still see
             the content) and not copy-protected (the client can restore an old
             cookie). The main intention is to make pickling and unpickling
             save, not to store secret information at client side.
-        '''
+        """
         if not self._cookies:
             self._cookies = SimpleCookie()
 
-        if secret:
-            value = touni(cookie_encode((name, value), secret))
-        elif not isinstance(value, basestring):
-            raise TypeError('Secret key missing for non-string Cookie.')
+        # Monkey-patch Cookie lib to support 'SameSite' parameter
+        # https://tools.ietf.org/html/draft-west-first-party-cookies-07#section-4.1
+        if py < (3, 8, 0):
+            Morsel._reserved.setdefault('samesite', 'SameSite')
 
-        if len(value) > 4096: raise ValueError('Cookie value to long.')
+        if secret:
+            if not isinstance(value, basestring):
+                depr(0, 13, "Pickling of arbitrary objects into cookies is "
+                            "deprecated.", "Only store strings in cookies. "
+                            "JSON strings are fine, too.")
+            encoded = base64.b64encode(pickle.dumps([name, value], -1))
+            sig = base64.b64encode(hmac.new(tob(secret), encoded,
+                                            digestmod=digestmod).digest())
+            value = touni(tob('!') + sig + tob('?') + encoded)
+        elif not isinstance(value, basestring):
+            raise TypeError('Secret key required for non-string cookies.')
+
+        # Cookie size plus options must not exceed 4kb.
+        if len(name) + len(value) > 3800:
+            raise ValueError('Content does not fit into a cookie.')
+
         self._cookies[name] = value
 
         for key, value in options.items():
-            if key == 'max_age':
+            if key in ('max_age', 'maxage'): # 'maxage' variant added in 0.13
+                key = 'max-age'
                 if isinstance(value, timedelta):
                     value = value.seconds + value.days * 24 * 3600
             if key == 'expires':
-                if isinstance(value, (datedate, datetime)):
-                    value = value.timetuple()
-                elif isinstance(value, (int, float)):
-                    value = time.gmtime(value)
-                value = time.strftime("%a, %d %b %Y %H:%M:%S GMT", value)
-            self._cookies[name][key.replace('_', '-')] = value
+                value = http_date(value)
+            if key in ('same_site', 'samesite'): # 'samesite' variant added in 0.13
+                key, value = 'samesite', (value or "none").lower()
+                if value not in ('lax', 'strict', 'none'):
+                    raise CookieError("Invalid value for SameSite")
+            if key in ('secure', 'httponly') and not value:
+                continue
+            self._cookies[name][key] = value
 
     def delete_cookie(self, key, **kwargs):
         ''' Delete a cookie. Be sure to use the same `domain` and `path`
